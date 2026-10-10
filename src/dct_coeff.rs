@@ -50,8 +50,11 @@
 
 #![allow(clippy::unusual_byte_groupings)]
 
+use std::sync::OnceLock;
+
 use oxideav_core::bits::BitReader;
 
+use crate::dct_coeff_lut::CoeffLut;
 use crate::{Error, Result};
 
 // =============================================================
@@ -915,53 +918,34 @@ impl DctCoeffStep {
         // fit in `peek_w`.
         let aligned = peeked << (MAX_CODE_LEN - peek_w);
 
-        // (1) Table entries: cand_w + 1 bits needed (codeword + sign).
-        // Iterate widths longest-first. The codeword widths that
-        // appear in Tables B.5c / B.5d / B.5e are exactly:
-        //   B.5c: 1, 2, 3, 4, 5, 6, 7, 8, 10
-        //   B.5d: 12, 13
-        //   B.5e: 14, 15, 16
-        for &cand_w in &[16u8, 15, 14, 13, 12, 10, 8, 7, 6, 5, 4, 3, 2, 1] {
-            let needed = u32::from(cand_w) + 1;
-            if available < needed {
-                continue;
-            }
-            let candidate = aligned >> (MAX_CODE_LEN - u32::from(cand_w));
-            for table in [TABLE_B5C, TABLE_B5D, TABLE_B5E] {
-                for &entry in table {
-                    if entry.bits != cand_w || u32::from(entry.code) != candidate {
-                        continue;
-                    }
-                    // Reject the `1s` 1-bit FIRST-only entry at NEXT.
-                    if entry.bits == 1 && position == CoefficientPosition::Next {
-                        continue;
-                    }
-                    // Reject the `11s` 2-bit NEXT-only entry at FIRST.
-                    if entry.bits == 2
-                        && entry.code == 0b11
-                        && position == CoefficientPosition::First
-                    {
-                        continue;
-                    }
-                    // Consume the codeword + sign.
-                    br.consume(u32::from(entry.bits))
-                        .map_err(|_| Error::ShortHeader)?;
-                    let sign = br.read_u1().map_err(|_| Error::ShortHeader)?;
-                    let signed_level = if sign == 0 {
-                        i16::from(entry.level)
-                    } else {
-                        -i16::from(entry.level)
-                    };
-                    return Ok(Self {
-                        symbol: DctCoeff::RunLevel {
-                            run: entry.run,
-                            signed_level,
-                            escape: false,
-                        },
-                        bit_position_after: br.bit_position(),
-                    });
-                }
-            }
+        // (1) Table entries (codeword + sign bit). With the full
+        // 17-bit window in hand, any entry fits, and the
+        // decode table gives the entry the longest-first walk would.
+        // Near the end of the buffer the walk decides which entries
+        // fit.
+        let entry = if peek_w == MAX_CODE_LEN {
+            decode_lut(position).lookup((aligned >> 1) as u16)
+        } else {
+            walk_rows(position, available, aligned)
+        };
+        if let Some(entry) = entry {
+            // Consume the codeword + sign.
+            br.consume(u32::from(entry.bits))
+                .map_err(|_| Error::ShortHeader)?;
+            let sign = br.read_u1().map_err(|_| Error::ShortHeader)?;
+            let signed_level = if sign == 0 {
+                i16::from(entry.level)
+            } else {
+                -i16::from(entry.level)
+            };
+            return Ok(Self {
+                symbol: DctCoeff::RunLevel {
+                    run: entry.run,
+                    signed_level,
+                    escape: false,
+                },
+                bit_position_after: br.bit_position(),
+            });
         }
 
         // (2) Special codewords (no sign bit).
@@ -1059,6 +1043,74 @@ impl DctCoeffStep {
 /// Minimum number of bits the Table B.5f escape payload requires
 /// after the escape prefix (`6` run + `8` short-form level = 14).
 const ESCAPE_LEVEL_MIN_PAYLOAD_BITS: u32 = 14;
+
+/// Longest-first walk over Tables B.5c / B.5d / B.5e for the entry
+/// whose codeword starts `aligned` (the next [`MAX_CODE_LEN`] bits,
+/// MSB-first, zero-padded past the end of the buffer), considering
+/// only entries that fit in `available` bits with their sign bit.
+fn walk_rows(position: CoefficientPosition, available: u32, aligned: u32) -> Option<CoeffEntry> {
+    // Iterate widths longest-first. The codeword widths that
+    // appear in Tables B.5c / B.5d / B.5e are exactly:
+    //   B.5c: 1, 2, 3, 4, 5, 6, 7, 8, 10
+    //   B.5d: 12, 13
+    //   B.5e: 14, 15, 16
+    for &cand_w in &[16u8, 15, 14, 13, 12, 10, 8, 7, 6, 5, 4, 3, 2, 1] {
+        let needed = u32::from(cand_w) + 1;
+        if available < needed {
+            continue;
+        }
+        let candidate = aligned >> (MAX_CODE_LEN - u32::from(cand_w));
+        for table in [TABLE_B5C, TABLE_B5D, TABLE_B5E] {
+            for &entry in table {
+                if entry.bits == cand_w
+                    && u32::from(entry.code) == candidate
+                    && row_allowed(position, &entry)
+                {
+                    return Some(entry);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The `(0, 1)` FIRST/NEXT gating.
+fn row_allowed(position: CoefficientPosition, entry: &CoeffEntry) -> bool {
+    // Reject the `1s` 1-bit FIRST-only entry at NEXT.
+    if entry.bits == 1 && position == CoefficientPosition::Next {
+        return false;
+    }
+    // Reject the `11s` 2-bit NEXT-only entry at FIRST.
+    if entry.bits == 2 && entry.code == 0b11 && position == CoefficientPosition::First {
+        return false;
+    }
+    true
+}
+
+/// The decode table for `position`: the entries [`walk_rows`] would
+/// consider, indexed for one lookup per codeword. Built on first use.
+fn decode_lut(position: CoefficientPosition) -> &'static CoeffLut<CoeffEntry> {
+    static LUTS: OnceLock<[CoeffLut<CoeffEntry>; 2]> = OnceLock::new();
+    let build = |position| {
+        CoeffLut::new(
+            [TABLE_B5C, TABLE_B5D, TABLE_B5E]
+                .into_iter()
+                .flatten()
+                .filter(|e| row_allowed(position, e))
+                .map(|e| (e.code, e.bits, *e)),
+        )
+    };
+    let luts = LUTS.get_or_init(|| {
+        [
+            build(CoefficientPosition::First),
+            build(CoefficientPosition::Next),
+        ]
+    });
+    match position {
+        CoefficientPosition::First => &luts[0],
+        CoefficientPosition::Next => &luts[1],
+    }
+}
 
 // =============================================================
 // Encoder side — §2.4.3.7 emission
@@ -1323,6 +1375,22 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn decode_lut_matches_walk_for_every_16_bit_window() {
+        let key = |e: CoeffEntry| (e.code, e.bits, e.run, e.level);
+        for position in [CoefficientPosition::First, CoefficientPosition::Next] {
+            let lut = decode_lut(position);
+            for window in 0..=u16::MAX {
+                let walked = walk_rows(position, MAX_CODE_LEN, u32::from(window) << 1);
+                assert_eq!(
+                    lut.lookup(window).map(key),
+                    walked.map(key),
+                    "{position:?} window {window:016b}"
+                );
             }
         }
     }

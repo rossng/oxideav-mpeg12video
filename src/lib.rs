@@ -370,6 +370,7 @@ pub mod copyright_extension;
 #[doc(hidden)] // internal: MPEG-1 §2.4.3.7 run-level VLC walker
 pub mod data_partitioning;
 pub mod dct_coeff;
+mod dct_coeff_lut;
 pub mod decoder;
 #[doc(hidden)] // internal: MPEG-1 §2.4.4 dequantiser stage
 pub mod dequantize;
